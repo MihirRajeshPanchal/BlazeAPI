@@ -1,5 +1,4 @@
 import logging
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -13,11 +12,7 @@ logging.basicConfig(
 
 app = FastAPI(
     title="MachAPI — Dynamic AI Endpoint Builder",
-    description=(
-        "Register custom AI-powered endpoints at runtime. "
-        "Each endpoint is namespaced by username: `/{username}/{endpoint_name}`. "
-        "Endpoints and user API keys are persisted in SQLite so they survive restarts."
-    ),
+    description="Register custom AI-powered endpoints at runtime (PostgreSQL backed).",
     version="2.0.0",
 )
 
@@ -33,21 +28,19 @@ app.include_router(management_router)
 app.include_router(dynamic_router)
 
 
-@app.get("/", tags=["Health"])
-def root():
-    return {
-        "status": "running",
-        "docs": "/docs",
-        "usage": {
-            "store_api_key":     "POST /users/api-key",
-            "register_endpoint": "POST /register",
-            "call_endpoint":     "POST /{username}/{endpoint_name}",
-            "list_endpoints":    "GET  /list",
-            "delete_endpoint":   "DELETE /{username}/{endpoint_name}",
-        },
-    }
+# ✅ CRITICAL FIX
+@app.on_event("startup")
+async def startup():
+    from backend.services.registry_service import init_db_pool, init_db
+    await init_db_pool()
+    await init_db()
 
 
-@app.get("/health", tags=["Health"])
-def health():
+@app.get("/")
+async def root():
+    return {"status": "running", "docs": "/docs"}
+
+
+@app.get("/health")
+async def health():
     return {"status": "ok"}
