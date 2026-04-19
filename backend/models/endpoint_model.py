@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
-# ── Input field descriptor (unchanged) ────────────────────────────────────────
+# ── Input field descriptor ─────────────────────────────────────────────────────
 
 class InputField(BaseModel):
     name: str = Field(..., description="Field name used as key in request body")
@@ -22,16 +22,6 @@ class EndpointConfig(BaseModel):
     endpoint_name: str
     username: str
     input_fields: List[InputField]
-    # ↓ NEW: full JSON Schema object, e.g.
-    # {
-    #   "title": "SentimentResult",
-    #   "type": "object",
-    #   "required": ["sentiment", "confidence"],
-    #   "properties": {
-    #     "sentiment": {"type": "string", "enum": ["positive","negative","neutral"]},
-    #     "confidence": {"type": "number"}
-    #   }
-    # }
     output_schema: Dict[str, Any] = Field(
         ...,
         description="A JSON Schema object describing the expected AI output structure.",
@@ -52,13 +42,21 @@ class EndpointConfigCreate(BaseModel):
     )
     ai_prompt: str
     description: Optional[str] = None
-    # Optional here — can also be stored at the user level via POST /users/api-key
     gemini_api_key: Optional[str] = Field(
         default=None,
         description=(
             "Gemini API key. If omitted, the key previously stored for this username is used."
         ),
     )
+
+
+class EndpointConfigUpdate(BaseModel):
+    """All fields are optional — only provided fields are updated."""
+    input_fields: Optional[List[InputField]] = None
+    output_schema: Optional[Dict[str, Any]] = None
+    ai_prompt: Optional[str] = None
+    description: Optional[str] = None
+    gemini_api_key: Optional[str] = None
 
 
 # ── Request / Response ─────────────────────────────────────────────────────────
@@ -87,8 +85,26 @@ class EndpointListItem(BaseModel):
     created_at: datetime
 
 
-# ── User API-key management ────────────────────────────────────────────────────
+# ── User management ────────────────────────────────────────────────────────────
+
+class UserRegisterPayload(BaseModel):
+    username: str
+    password: str = Field(..., min_length=8, description="Minimum 8 characters")
+    gemini_api_key: Optional[str] = None
+
+
+class UserLoginPayload(BaseModel):
+    username: str
+    password: str
+
+
+class UserLoginResponse(BaseModel):
+    username: str
+    token: str
+    message: str = "Login successful"
+
 
 class UserApiKeyPayload(BaseModel):
     username: str
+    password: str = Field(..., description="Required to authenticate the key update")
     gemini_api_key: str

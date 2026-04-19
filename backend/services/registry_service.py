@@ -1,18 +1,22 @@
 """
 Persistent endpoint registry backed by SQLite.
-All registered endpoints survive server restarts.
+Users have hashed passwords. All registered endpoints survive server restarts.
 """
 import json
 import logging
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
+
+import bcrypt
 
 from backend.models.endpoint_model import (
     EndpointConfig,
     EndpointConfigCreate,
+    EndpointConfigUpdate,
     InputField,
 )
 
@@ -27,8 +31,8 @@ _DDL = """
 CREATE TABLE IF NOT EXISTS endpoints (
     username        TEXT    NOT NULL,
     endpoint_name   TEXT    NOT NULL,
-    input_fields    TEXT    NOT NULL,   -- JSON array
-    output_schema   TEXT    NOT NULL,   -- JSON Schema object (the new format)
+    input_fields    TEXT    NOT NULL,
+    output_schema   TEXT    NOT NULL,
     ai_prompt       TEXT    NOT NULL,
     description     TEXT,
     gemini_api_key  TEXT    NOT NULL,
@@ -38,7 +42,9 @@ CREATE TABLE IF NOT EXISTS endpoints (
 
 CREATE TABLE IF NOT EXISTS users (
     username        TEXT    PRIMARY KEY,
-    gemini_api_key  TEXT    NOT NULL
+    password_hash   TEXT    NOT NULL,
+    gemini_api_key  TEXT,
+    token           TEXT
 );
 """
 
@@ -58,8 +64,26 @@ def _init_db() -> None:
     with _conn() as con:
         con.executescript(_DDL)
 
+    # Migration: add password_hash column to users if upgrading from old schema
+    with _conn() as con:
+        cols = [r[1] for r in con.execute("PRAGMA table_info(users)").fetchall()]
+        if "password_hash" not in cols:
+            con.execute("ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''")
+        if "token" not in cols:
+            con.execute("ALTER TABLE users ADD COLUMN token TEXT")
+
 
 _init_db()
+
+
+# ── Password helpers ───────────────────────────────────────────────────────────
+
+def _hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
+def _verify_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode(), hashed.encode())
 
 
 # ── Serialisation helpers ──────────────────────────────────────────────────────
@@ -78,20 +102,70 @@ def _row_to_config(row: sqlite3.Row) -> EndpointConfig:
     )
 
 
-# ── Public API ─────────────────────────────────────────────────────────────────
+# ── User management ────────────────────────────────────────────────────────────
+
+def register_user(username: str, password: str, gemini_api_key: Optional[str] = None) -> None:
+    """Create a new user. Raises ValueError if username already exists."""
+    username = username.lower()
+    with _conn() as con:
+        existing = con.execute(
+            "SELECT username FROM users WHERE username = ?", (username,)
+        ).fetchone()
+        if existing:
+            raise ValueError(f"Username '{username}' is already taken.")
+        con.execute(
+            "INSERT INTO users (username, password_hash, gemini_api_key) VALUES (?, ?, ?)",
+            (username, _hash_password(password), gemini_api_key),
+        )
+    logger.info("Registered new user: %s", username)
+
+
+def authenticate_user(username: str, password: str) -> Optional[str]:
+    """
+    Verify credentials. On success, generates + stores a session token and returns it.
+    Returns None if credentials are invalid.
+    """
+    username = username.lower()
+    with _conn() as con:
+        row = con.execute(
+            "SELECT password_hash FROM users WHERE username = ?", (username,)
+        ).fetchone()
+        if not row or not _verify_password(password, row["password_hash"]):
+            return None
+        token = secrets.token_urlsafe(32)
+        con.execute("UPDATE users SET token = ? WHERE username = ?", (token, username))
+    logger.info("User logged in: %s", username)
+    return token
+
+
+def verify_token(username: str, token: str) -> bool:
+    """Check that a bearer token matches the stored token for this user."""
+    username = username.lower()
+    with _conn() as con:
+        row = con.execute(
+            "SELECT token FROM users WHERE username = ?", (username,)
+        ).fetchone()
+    return bool(row and row["token"] and secrets.compare_digest(row["token"], token))
+
+
+def verify_password_for_user(username: str, password: str) -> bool:
+    """Lightweight credential check without issuing a token."""
+    username = username.lower()
+    with _conn() as con:
+        row = con.execute(
+            "SELECT password_hash FROM users WHERE username = ?", (username,)
+        ).fetchone()
+    return bool(row and _verify_password(password, row["password_hash"]))
+
 
 def upsert_user_api_key(username: str, gemini_api_key: str) -> None:
-    """Store or update a user's Gemini API key."""
+    """Update a user's stored Gemini API key (user must already exist)."""
     with _conn() as con:
         con.execute(
-            """
-            INSERT INTO users (username, gemini_api_key)
-            VALUES (?, ?)
-            ON CONFLICT(username) DO UPDATE SET gemini_api_key = excluded.gemini_api_key
-            """,
-            (username.lower(), gemini_api_key),
+            "UPDATE users SET gemini_api_key = ? WHERE username = ?",
+            (gemini_api_key, username.lower()),
         )
-    logger.info("Upserted Gemini API key for user: %s", username)
+    logger.info("Updated Gemini API key for user: %s", username)
 
 
 def get_user_api_key(username: str) -> Optional[str]:
@@ -103,19 +177,19 @@ def get_user_api_key(username: str) -> Optional[str]:
     return row["gemini_api_key"] if row else None
 
 
+# ── Endpoint CRUD ──────────────────────────────────────────────────────────────
+
 def register_endpoint(payload: EndpointConfigCreate) -> EndpointConfig:
     username = payload.username.lower()
     endpoint_name = payload.endpoint_name.lower()
 
-    # Resolve Gemini API key: payload overrides, else fall back to stored user key
     gemini_api_key = payload.gemini_api_key or get_user_api_key(username)
     if not gemini_api_key:
         raise ValueError(
             f"No Gemini API key found for user '{username}'. "
-            "Either pass gemini_api_key in this request or register it via POST /users/api-key."
+            "Either pass gemini_api_key in this request or set it via POST /users/api-key."
         )
 
-    # Persist the key for future endpoints from the same user
     upsert_user_api_key(username, gemini_api_key)
 
     now = datetime.utcnow().isoformat()
@@ -145,6 +219,50 @@ def register_endpoint(payload: EndpointConfigCreate) -> EndpointConfig:
             ),
         )
     logger.info("Registered endpoint: /%s/%s", username, endpoint_name)
+    return get_endpoint(username, endpoint_name)
+
+
+def update_endpoint(
+    username: str, endpoint_name: str, patch: EndpointConfigUpdate
+) -> Optional[EndpointConfig]:
+    """
+    Partially update an existing endpoint. Only fields explicitly set in `patch` are changed.
+    Returns the updated config, or None if the endpoint doesn't exist.
+    """
+    username = username.lower()
+    endpoint_name = endpoint_name.lower()
+
+    existing = get_endpoint(username, endpoint_name)
+    if not existing:
+        return None
+
+    # Build SET clause dynamically from non-None patch fields
+    updates: Dict[str, object] = {}
+    if patch.input_fields is not None:
+        updates["input_fields"] = json.dumps([f.model_dump() for f in patch.input_fields])
+    if patch.output_schema is not None:
+        updates["output_schema"] = json.dumps(patch.output_schema)
+    if patch.ai_prompt is not None:
+        updates["ai_prompt"] = patch.ai_prompt
+    if patch.description is not None:
+        updates["description"] = patch.description
+    if patch.gemini_api_key is not None:
+        updates["gemini_api_key"] = patch.gemini_api_key
+        upsert_user_api_key(username, patch.gemini_api_key)
+
+    if not updates:
+        return existing  # nothing to change
+
+    set_clause = ", ".join(f"{col} = ?" for col in updates)
+    values = list(updates.values()) + [username, endpoint_name]
+
+    with _conn() as con:
+        con.execute(
+            f"UPDATE endpoints SET {set_clause} WHERE username = ? AND endpoint_name = ?",
+            values,
+        )
+
+    logger.info("Updated endpoint: /%s/%s | fields: %s", username, endpoint_name, list(updates))
     return get_endpoint(username, endpoint_name)
 
 
